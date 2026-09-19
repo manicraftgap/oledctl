@@ -1,4 +1,3 @@
-```markdown
 # oledctl
 
 This program works as a middleman between brightnessctl and gammastep[cite: 1]. It keeps gammastep's color temperature in sync with brightnessctl's brightness, so it feels like adjusting the same brightness brightnessctl reports[cite: 1]. This is needed on most OLED displays, which lack a backlight and don't expose any way to change the pixel brightness directly[cite: 1].
