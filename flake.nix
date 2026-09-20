@@ -1,5 +1,5 @@
 {
-  description = "oledctl - oledctl works as a middleman between brightnessctl and gammastep.";
+  description = "oledctl - oledctl works as a middleman between brightnessctl and hyprsunset.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -26,7 +26,7 @@
             vendorHash = null;
 
             meta = with pkgs.lib; {
-              description = "OLED brightness control wrapper over brightnessctl";
+              description = "OLED brightness control wrapper over brightnessctl and hyprsunset";
               license = licenses.mit;
               mainProgram = "oledctl";
             };
@@ -57,8 +57,18 @@
 
             environment.systemPackages = [
               oledctlPkg
-              pkgs.gammastep
+              pkgs.hyprsunset
             ];
+
+            # oledctl only talks to hyprsunset over hyprctl's IPC — it
+            # never starts or stops it. hyprsunset itself still needs to
+            # be running as a persistent daemon, which this module does
+            # NOT set up automatically (that's a per-user Hyprland
+            # concern, not a system service). Add one of the following
+            # to your Home Manager / hyprland.conf:
+            #   exec-once = hyprsunset
+            # or enable it as a systemd user service:
+            #   systemctl --user enable --now hyprsunset.service
           };
         };
     };

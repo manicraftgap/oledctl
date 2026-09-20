@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -36,20 +34,17 @@ func findRealBrightnessctl() (string, error) {
 	return "/usr/bin/brightnessctl", nil
 }
 
-const (
-	// Color temperature is always kept at 6500K (neutral/no shift) —
-	// only brightness is adjusted via gammastep's -b parameter.
-	fixedTemp = "6500K"
-)
-
 var (
 	currentBrightness int // percentage, 0-100
 	newBrightness     int
 )
 
-// commandTimeout bounds how long a quick, expected-to-exit external
-// command (brightnessctl) is allowed to run. This is NOT used for
-// gammastep — see syncGammastep below for why.
+// commandTimeout bounds how long any external command (brightnessctl or
+// hyprctl) is allowed to run. Unlike the gammastep version of oledctl,
+// this applies uniformly — there's no long-lived background process to
+// special-case here, since hyprsunset is its own persistent daemon that
+// oledctl never starts or stops. Every call oledctl makes is a quick,
+// synchronous IPC round trip that's expected to return almost instantly.
 const commandTimeout = 5 * time.Second
 
 func runCommand(name string, args ...string) (string, error) {
@@ -78,96 +73,50 @@ func runCommand(name string, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
-// gammastep is launched detached and tracked by PID, and killed only when
-// a new brightness value needs to be applied. Because oledctl is stateless
-// between invocations, that PID is tracked on disk rather than in memory.
-func gammastepPIDPath() string {
-	dir := os.Getenv("XDG_RUNTIME_DIR")
-	if dir == "" {
-		dir = os.TempDir()
-	}
-	return filepath.Join(dir, "oledctl-gammastep.pid")
-}
-
-// stopPreviousGammastep kills whatever gammastep process oledctl last
-// started (if any), tracked via gammastepPIDPath, and waits for it to
-// actually exit so the replacement process doesn't race it for the
-// gamma-control object. Safe to call even if nothing is tracked, or if
-// the tracked process has already died on its own.
-func stopPreviousGammastep() {
-	pidPath := gammastepPIDPath()
-	data, err := os.ReadFile(pidPath)
-	if err != nil {
-		return // nothing tracked
-	}
-	defer os.Remove(pidPath)
-
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		return
-	}
-
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return
-	}
-
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		return // already gone
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := proc.Signal(syscall.Signal(0)); err != nil {
-			return // exited
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	// didn't exit cleanly within the grace period — force it, so a stuck
-	// gammastep can never accumulate as an orphaned process
-	_ = proc.Signal(syscall.SIGKILL)
-}
-
-// startGammastep launches gammastep detached from oledctl's own process
-// (Setsid, so it survives oledctl exiting and isn't taken down if a
-// terminal oledctl was run from closes) and records its PID so a future
-// invocation can stop it. This does NOT wait for it to exit — it's meant
-// to keep running until explicitly replaced. A background goroutine reaps
-// it once it eventually does exit, to avoid a zombie process.
-func startGammastep(percent int) error {
+// clampPercent constrains a brightness percentage to hyprsunset's gamma
+// range. hyprsunset's default max-gamma is 100 (its absolute ceiling is
+// 200, configurable via hyprsunset.conf), so 0-100 is the range that's
+// guaranteed to work without the user needing to raise max-gamma.
+func clampPercent(percent int) int {
 	if percent < 0 {
-		percent = 0
+		return 0
 	}
 	if percent > 100 {
-		percent = 100
+		return 100
 	}
-	ratio := float64(percent) / 100.0
-	brightArg := fmt.Sprintf("%.2f:%.2f", ratio, ratio) // day:night, kept equal for a manual one-shot
-
-	cmd := exec.Command("gammastep", "-O", fixedTemp, "-b", brightArg)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting gammastep: %w", err)
-	}
-
-	if err := os.WriteFile(gammastepPIDPath(), []byte(strconv.Itoa(cmd.Process.Pid)), 0o644); err != nil {
-		return fmt.Errorf("recording gammastep pid: %w", err)
-	}
-
-	go cmd.Wait() // reap it when it eventually exits; don't block on it
-
-	return nil
+	return percent
 }
 
-// syncGammastep applies the given brightness percentage to the display.
-// Temperature is always fixedTemp (6500K) — only the brightness ratio
-// changes, e.g. `gammastep -O 6500K -b 0.40:0.40` for 40%. Kills any
-// previously-tracked gammastep before starting the new one. Returns
-// immediately — does not wait on gammastep exiting.
-func syncGammastep(percent int) error {
-	stopPreviousGammastep()
-	return startGammastep(percent)
+// syncHyprsunset applies the given brightness percentage via hyprsunset's
+// gamma filter, keeping the color temperature filter permanently
+// disabled (`identity`) so only perceived brightness changes — mirroring
+// the fixed-6500K behavior of the gammastep-based version of oledctl.
+//
+// Unlike gammastep, hyprsunset is not something oledctl starts or stops.
+// It's expected to already be running as a long-lived daemon (typically
+// via `exec-once = hyprsunset` in hyprland.conf, or its systemd user
+// service). oledctl just sends it a live update over hyprctl's IPC —
+// there's no process handoff, no gamma-control object to hand off
+// between processes, and so no gap where the compositor could fall back
+// to a default gamma table. That handoff gap — and the resulting blink
+// on every brightness change — is exactly what made the gammastep-based
+// version tricky to get right; this version doesn't have the problem to
+// begin with, since the daemon holding the gamma-control object never
+// changes, only the values it's told to apply.
+//
+// If hyprsunset isn't running, the `hyprctl hyprsunset ...` calls below
+// fail fast (hyprctl returns an error rather than hanging), and that
+// error is surfaced to the user rather than silently swallowed.
+func syncHyprsunset(percent int) error {
+	if _, err := runCommand("hyprctl", "hyprsunset", "identity"); err != nil {
+		return fmt.Errorf("disabling hyprsunset color temperature filter: %w (is hyprsunset running?)", err)
+	}
+
+	if _, err := runCommand("hyprctl", "hyprsunset", "gamma", strconv.Itoa(clampPercent(percent))); err != nil {
+		return fmt.Errorf("setting hyprsunset gamma: %w (is hyprsunset running?)", err)
+	}
+
+	return nil
 }
 
 // printStatus prints brightnessctl's own status line verbatim via
@@ -183,8 +132,8 @@ func printStatus() error {
 
 // getBrightness reads the current brightness percentage fresh from
 // brightnessctl into currentBrightness. Used internally
-// wherever we need a 0-100 number to drive gammastep's -b ratio (e.g.
-// syncing after a brightness change).
+// wherever we need a 0-100 number to drive hyprsunset's gamma value
+// (e.g. syncing after a brightness change).
 func getBrightness() error {
 	out, err := runCommand("brightnessctl", "-m")
 	if err != nil {
@@ -207,20 +156,20 @@ func getBrightness() error {
 }
 
 // adjustBrightness changes brightness by delta (positive to increase,
-// negative to decrease), clamped to 0-100, then syncs gammastep to
+// negative to decrease), clamped to 0-100, then syncs hyprsunset to
 // match. flags are any extra arguments that followed "up"/"down" and
 // weren't the step number — they're forwarded to the underlying
 // `brightnessctl set` call verbatim (e.g. -q, -p, -d eDP-1).
 //
 // After the set call, brightness is re-read from brightnessctl rather
-// than trusting the computed value, and gammastep is synced to that.
+// than trusting the computed value, and hyprsunset is synced to that.
 // The set call can succeed (exit 0, no error) without the backlight
 // actually changing — e.g. -p/--pretend explicitly skips the write, or
 // a stray non-flag token upstream in parseUpDownArgs could in principle
 // get consumed as brightnessctl's operation instead of "set". Trusting
-// our own guess in either case would resync gammastep to a brightness
-// the screen never reached, only for the next invocation to correct it
-// (a visible flicker). Re-reading avoids that class of bug entirely.
+// our own guess in either case would resync hyprsunset to a brightness
+// the screen never reached, only for the next invocation to correct it.
+// Re-reading avoids that class of bug entirely.
 func adjustBrightness(delta int, flags []string) {
 	if err := getBrightness(); err != nil {
 		fmt.Println("error:", err)
@@ -245,11 +194,11 @@ func adjustBrightness(delta int, flags []string) {
 	fmt.Println(out)
 
 	if err := getBrightness(); err != nil {
-		fmt.Println("error syncing gammastep:", err)
+		fmt.Println("error syncing hyprsunset:", err)
 		return
 	}
-	if err := syncGammastep(currentBrightness); err != nil {
-		fmt.Println("error syncing gammastep:", err)
+	if err := syncHyprsunset(currentBrightness); err != nil {
+		fmt.Println("error syncing hyprsunset:", err)
 	}
 }
 
@@ -269,7 +218,7 @@ func passthroughBrightnessctl(args []string) error {
 
 // isSetOperation reports whether args contains brightnessctl's "s" or
 // "set" operation token, meaning brightness may have changed and
-// gammastep needs to be resynced afterward. This is a simple token scan
+// hyprsunset needs to be resynced afterward. This is a simple token scan
 // rather than full option parsing, so it can misfire if "set" is used as
 // the literal value of e.g. -d/--device — an acceptably rare edge case,
 // since a missed resync just self-corrects on the next brightness change.
@@ -342,13 +291,13 @@ SYNOPSIS
 OLEDCTL OPERATIONS
     up [STEP] [param...]
         Increase brightness by STEP percent (default 10), then resync
-        gammastep's color temperature to the new brightness. Any
-        argument that isn't an integer is treated as a brightnessctl
-        parameter and forwarded as-is (e.g. -q, -p, -d eDP-1).
+        hyprsunset's gamma filter to the new brightness. Any argument
+        that isn't an integer is treated as a brightnessctl parameter
+        and forwarded as-is (e.g. -q, -p, -d eDP-1).
     down [STEP] [param...]
         Decrease brightness by STEP percent (default 10), then resync
-        gammastep's color temperature to the new brightness. Same
-        argument handling as up.
+        hyprsunset's gamma filter to the new brightness. Same argument
+        handling as up.
     status
         Print the current brightness (via brightnessctl -m get).
 
@@ -365,20 +314,29 @@ PASSED THROUGH TO BRIGHTNESSCTL
     -r/--restore, -d/--device, -c/--class, -v/--version — is forwarded
     to the real brightnessctl verbatim. Run "oledctl -h brightnessctl"
     for the full description of each. If the forwarded command is a
-    set (s/set), gammastep is resynced to the resulting brightness
+    set (s/set), hyprsunset is resynced to the resulting brightness
     afterward.
 
 DESCRIPTION
-    oledctl works as a middleman between brightnessctl and gammastep.
-    This keeps gammastep's color temperature in sync with
-    brightnessctl's brightness, so it feels like adjusting the same
-    brightness brightnessctl reports. This is needed on most OLED
-    displays, which lack a backlight and don't expose any way to
-    change the pixel brightness directly.
+    oledctl works as a middleman between brightnessctl and hyprsunset.
+    This keeps hyprsunset's gamma filter in sync with brightnessctl's
+    brightness, so it feels like adjusting the same brightness
+    brightnessctl reports. This is needed on most OLED displays, which
+    lack a backlight and don't expose any way to change the pixel
+    brightness directly. hyprsunset's color temperature filter is kept
+    permanently disabled (identity) — only its gamma filter is used,
+    to isolate brightness from color shift.
+
+    hyprsunset must already be running (e.g. via "exec-once =
+    hyprsunset" in hyprland.conf, or its systemd user service) —
+    oledctl only talks to it over hyprctl's IPC and never starts or
+    stops it itself.
 
 AUTHORS
     See https://github.com/Hummer12007/brightnessctl for
     information about brightnessctl and its source code.
+    See https://wiki.hypr.land/Hypr-Ecosystem/hyprsunset/ for
+    information about hyprsunset.
     See https://github.com/myuser/oledctl for information about
     oledctl and its source code.
 `
@@ -466,11 +424,11 @@ func main() {
 		}
 		if isSetOperation(args) {
 			if err := getBrightness(); err != nil {
-				fmt.Println("error syncing gammastep:", err)
+				fmt.Println("error syncing hyprsunset:", err)
 				return
 			}
-			if err := syncGammastep(currentBrightness); err != nil {
-				fmt.Println("error syncing gammastep:", err)
+			if err := syncHyprsunset(currentBrightness); err != nil {
+				fmt.Println("error syncing hyprsunset:", err)
 			}
 		}
 	}
