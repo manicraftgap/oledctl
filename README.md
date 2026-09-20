@@ -6,6 +6,8 @@ hyprsunset's color temperature filter is kept permanently disabled (`identity`) 
 
 Unlike the gammastep-based version of oledctl, this version never starts or stops a background process itself. hyprsunset is expected to already be running as your own persistent daemon, and oledctl just sends it live updates over `hyprctl`'s IPC. That also means there's nothing to hand off between processes on each brightness change, so there's no gap where the display could flash to a default gamma table.
 
+> **Note:** this hyprsunset-based version lives on the `hyprsunset` branch of the `oledctl` repo, not on `main` (which uses gammastep). All commands below target that branch.
+
 ## Requirements
 
 - **Hyprland** — hyprsunset's IPC is exposed through `hyprctl`, so this version only works under Hyprland.
@@ -22,14 +24,14 @@ Unlike the gammastep-based version of oledctl, this version never starts or stop
 ## Installation
 
 ### Nix Flakes (NixOS or systems with Nix installed)
-You can run it directly from GitHub without cloning:
+You can run it directly from GitHub without cloning — note the trailing `/hyprsunset`, which selects the branch:
 ```bash
-nix run github:manicraftgap/oledctl-hyprsunset
+nix run github:manicraftgap/oledctl/hyprsunset
 ```
 
 To add it to your NixOS configuration or Home Manager, add it to your flake inputs:
 ```nix
-inputs.oledctl-hyprsunset.url = "github:manicraftgap/oledctl-hyprsunset";
+inputs.oledctl.url = "github:manicraftgap/oledctl/hyprsunset";
 ```
 
 ### Arch Linux
@@ -39,10 +41,10 @@ First, install the required dependencies and the Go compiler:
 sudo pacman -S brightnessctl hyprsunset go
 ```
 
-Then, clone and build the program:
+Then, clone the `hyprsunset` branch and build the program:
 ```bash
-git clone https://github.com/manicraftgap/oledctl-hyprsunset.git
-cd oledctl-hyprsunset
+git clone -b hyprsunset https://github.com/manicraftgap/oledctl.git
+cd oledctl
 go build -o oledctl ./cmd/oledctl
 sudo mv oledctl /usr/local/bin/
 ```
@@ -55,10 +57,10 @@ sudo apt update
 sudo apt install brightnessctl golang
 ```
 
-Then, clone and build the program:
+Then, clone the `hyprsunset` branch and build the program:
 ```bash
-git clone https://github.com/manicraftgap/oledctl-hyprsunset.git
-cd oledctl-hyprsunset
+git clone -b hyprsunset https://github.com/manicraftgap/oledctl.git
+cd oledctl
 go build -o oledctl ./cmd/oledctl
 sudo mv oledctl /usr/local/bin/
 ```
@@ -70,10 +72,10 @@ First, install the required dependencies and the Go compiler:
 sudo xbps-install -S brightnessctl hyprsunset go
 ```
 
-Then, clone and build the program:
+Then, clone the `hyprsunset` branch and build the program:
 ```bash
-git clone https://github.com/manicraftgap/oledctl-hyprsunset.git
-cd oledctl-hyprsunset
+git clone -b hyprsunset https://github.com/manicraftgap/oledctl.git
+cd oledctl
 go build -o oledctl ./cmd/oledctl
 sudo mv oledctl /usr/local/bin/
 ```
