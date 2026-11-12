@@ -12,12 +12,12 @@ import (
 )
 
 func findRealBrightnessctl() (string, error) {
-	// 1. If Nix specified an explicit path, use it directly
+	// Explicit override wins
 	if envPath := os.Getenv("REAL_BRIGHTNESSCTL"); envPath != "" {
 		return envPath, nil
 	}
 
-	// Look through PATH, skipping any binary that resolves to this current executable
+	// Search PATH, skipping ourselves to avoid recursion
 	selfPath, _ := os.Executable()
 	pathEnv := os.Getenv("PATH")
 	paths := strings.Split(pathEnv, string(os.PathListSeparator))
@@ -39,16 +39,11 @@ var (
 	newBrightness     int
 )
 
-// commandTimeout bounds how long any external command (brightnessctl or
-// hyprctl) is allowed to run. Unlike the gammastep version of oledctl,
-// this applies uniformly — there's no long-lived background process to
-// special-case here, since hyprsunset is its own persistent daemon that
-// oledctl never starts or stops. Every call oledctl makes is a quick,
-// synchronous IPC round trip that's expected to return almost instantly.
+// All external calls are quick synchronous IPC, so one timeout fits all.
 const commandTimeout = 5 * time.Second
 
 func runCommand(name string, args ...string) (string, error) {
-	// If oledctl calls brightnessctl internally, route to the real binary directly
+	// Route internal brightnessctl calls to the real binary
 	if name == "brightnessctl" {
 		if realPath, err := findRealBrightnessctl(); err == nil {
 			name = realPath
@@ -73,10 +68,7 @@ func runCommand(name string, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
-// clampPercent constrains a brightness percentage to hyprsunset's gamma
-// range. hyprsunset's default max-gamma is 100 (its absolute ceiling is
-// 200, configurable via hyprsunset.conf), so 0-100 is the range that's
-// guaranteed to work without the user needing to raise max-gamma.
+// clampPercent constrains to hyprsunset's default gamma range (0-100).
 func clampPercent(percent int) int {
 	if percent < 0 {
 		return 0
@@ -87,26 +79,14 @@ func clampPercent(percent int) int {
 	return percent
 }
 
-// syncHyprsunset applies the given brightness percentage via hyprsunset's
-// gamma filter, keeping the color temperature filter permanently
-// disabled (`identity`) so only perceived brightness changes — mirroring
-// the fixed-6500K behavior of the gammastep-based version of oledctl.
+// syncHyprsunset pushes brightness to hyprsunset's gamma filter, keeping
+// color temperature fixed at identity so only brightness changes.
 //
-// Unlike gammastep, hyprsunset is not something oledctl starts or stops.
-// It's expected to already be running as a long-lived daemon (typically
-// via `exec-once = hyprsunset` in hyprland.conf, or its systemd user
-// service). oledctl just sends it a live update over hyprctl's IPC —
-// there's no process handoff, no gamma-control object to hand off
-// between processes, and so no gap where the compositor could fall back
-// to a default gamma table. That handoff gap — and the resulting blink
-// on every brightness change — is exactly what made the gammastep-based
-// version tricky to get right; this version doesn't have the problem to
-// begin with, since the daemon holding the gamma-control object never
-// changes, only the values it's told to apply.
-//
-// If hyprsunset isn't running, the `hyprctl hyprsunset ...` calls below
-// fail fast (hyprctl returns an error rather than hanging), and that
-// error is surfaced to the user rather than silently swallowed.
+// Unlike gammastep, oledctl never starts/stops hyprsunset — it's a
+// long-lived daemon (exec-once or systemd) that oledctl just updates over
+// IPC. That means no gamma-control handoff and no blink on brightness
+// change. If hyprsunset isn't running, these calls fail fast and the
+// error surfaces to the user.
 func syncHyprsunset(percent int) error {
 	if _, err := runCommand("hyprctl", "hyprsunset", "identity"); err != nil {
 		return fmt.Errorf("disabling hyprsunset color temperature filter: %w (is hyprsunset running?)", err)
@@ -119,8 +99,7 @@ func syncHyprsunset(percent int) error {
 	return nil
 }
 
-// printStatus prints brightnessctl's own status line verbatim via
-// `brightnessctl -m get`.
+// printStatus prints brightnessctl's own status line verbatim.
 func printStatus() error {
 	out, err := runCommand("brightnessctl", "-m", "get")
 	if err != nil {
@@ -130,10 +109,7 @@ func printStatus() error {
 	return nil
 }
 
-// getBrightness reads the current brightness percentage fresh from
-// brightnessctl into currentBrightness. Used internally
-// wherever we need a 0-100 number to drive hyprsunset's gamma value
-// (e.g. syncing after a brightness change).
+// getBrightness refreshes currentBrightness from brightnessctl.
 func getBrightness() error {
 	out, err := runCommand("brightnessctl", "-m")
 	if err != nil {
@@ -155,21 +131,14 @@ func getBrightness() error {
 	return nil
 }
 
-// adjustBrightness changes brightness by delta (positive to increase,
-// negative to decrease), clamped to 0-100, then syncs hyprsunset to
-// match. flags are any extra arguments that followed "up"/"down" and
-// weren't the step number — they're forwarded to the underlying
-// `brightnessctl set` call verbatim (e.g. -q, -p, -d eDP-1).
+// adjustBrightness changes brightness by delta (clamped 0-100) and syncs
+// hyprsunset to match. flags are extra args forwarded to `brightnessctl
+// set` verbatim (e.g. -q, -p, -d eDP-1).
 //
-// After the set call, brightness is re-read from brightnessctl rather
-// than trusting the computed value, and hyprsunset is synced to that.
-// The set call can succeed (exit 0, no error) without the backlight
-// actually changing — e.g. -p/--pretend explicitly skips the write, or
-// a stray non-flag token upstream in parseUpDownArgs could in principle
-// get consumed as brightnessctl's operation instead of "set". Trusting
-// our own guess in either case would resync hyprsunset to a brightness
-// the screen never reached, only for the next invocation to correct it.
-// Re-reading avoids that class of bug entirely.
+// Brightness is re-read after the set rather than trusted from the
+// computed value, since a set call can succeed without changing anything
+// (e.g. -p/--pretend, or a misparsed token). Re-reading avoids syncing
+// hyprsunset to a brightness the screen never reached.
 func adjustBrightness(delta int, flags []string) {
 	if err := getBrightness(); err != nil {
 		fmt.Println("error:", err)
@@ -203,10 +172,7 @@ func adjustBrightness(delta int, flags []string) {
 }
 
 // passthroughBrightnessctl forwards args to the real brightnessctl
-// verbatim and prints whatever it prints. Used for every brightnessctl
-// operation/option oledctl doesn't need to special-case itself (info,
-// get, max, list, quiet, pretend, machine-readable, min-value, exponent,
-// save, restore, device, class, version, and set).
+// verbatim (info, get, max, list, quiet, pretend, etc.).
 func passthroughBrightnessctl(args []string) error {
 	out, err := runCommand("brightnessctl", args...)
 	if err != nil {
@@ -216,12 +182,9 @@ func passthroughBrightnessctl(args []string) error {
 	return nil
 }
 
-// isSetOperation reports whether args contains brightnessctl's "s" or
-// "set" operation token, meaning brightness may have changed and
-// hyprsunset needs to be resynced afterward. This is a simple token scan
-// rather than full option parsing, so it can misfire if "set" is used as
-// the literal value of e.g. -d/--device — an acceptably rare edge case,
-// since a missed resync just self-corrects on the next brightness change.
+// isSetOperation reports whether args contains "s"/"set". Simple token
+// scan, not full parsing, so it can misfire if "set" is a flag's literal
+// value — rare, and self-corrects on the next brightness change.
 func isSetOperation(args []string) bool {
 	for _, a := range args {
 		if a == "s" || a == "set" {
@@ -239,17 +202,11 @@ func decreaseBrightness(step int, flags []string) {
 	adjustBrightness(-step, flags)
 }
 
-// parseUpDownArgs walks the arguments after "up"/"down". Each token that
-// parses as an integer is used as the step amount (only the first one —
-// a second integer is an error, not silently overwritten). Each token
-// starting with "-" is treated as a brightnessctl flag and collected to
-// forward as-is (e.g. -q, -p, -d eDP-1). Anything else — a bare word
-// that's neither an integer nor flag-shaped — is rejected outright:
-// forwarding it would let brightnessctl silently consume it as a bogus
-// operation instead of "set" (see the observed real brightnessctl
-// behavior with an unrecognized operation), which looks like a
-// successful write to oledctl but never actually changes anything. If
-// no integer is found, step defaults to defaultStep.
+// parseUpDownArgs parses args after "up"/"down": the first integer token
+// is the step (a second is an error), "-"-prefixed tokens are forwarded
+// flags, and anything else is rejected — otherwise it could get consumed
+// by brightnessctl as a bogus operation instead of "set", silently doing
+// nothing. Defaults to defaultStep if no integer is given.
 func parseUpDownArgs(args []string, defaultStep int) (step int, flags []string, err error) {
 	step = defaultStep
 	stepSet := false
@@ -337,21 +294,17 @@ AUTHORS
     information about brightnessctl and its source code.
     See https://wiki.hypr.land/Hypr-Ecosystem/hyprsunset/ for
     information about hyprsunset.
-    See https://github.com/myuser/oledctl for information about
-    oledctl and its source code.
+    See https://github.com/manicraftgap/oledctl/tree/hyprsunset for
+    information about this hyprsunset-based branch of oledctl.
 `
 
-// printOledctlHelp prints oledctl's own help text.
 func printOledctlHelp() {
 	fmt.Print(oledctlHelp)
 }
 
-// printBrightnessctlHelp shells out to the real brightnessctl's own
-// -h output and prints it verbatim, rather than duplicating it here,
-// so it can never drift out of sync with whatever version is installed.
-// Captures stdout and stderr together and prints whatever came back
-// regardless of exit code, since some builds write help text to
-// stderr rather than stdout.
+// printBrightnessctlHelp shells out to the real brightnessctl's -h so it
+// can never drift from the installed version. Captures stdout+stderr
+// together since some builds print help to stderr.
 func printBrightnessctlHelp() error {
 	realPath, err := findRealBrightnessctl()
 	if err != nil {
@@ -413,11 +366,7 @@ func main() {
 		}
 		decreaseBrightness(step, flags)
 	default:
-		// Everything else — i/info, g/get, m/max, s/set, -l, -q, -p,
-		// -n, -e, -s, -r, -d, -c, -v, and any combination of these
-		// preceding an operation — is real brightnessctl syntax that
-		// oledctl doesn't need to special-case, so it's forwarded
-		// verbatim to the real binary.
+		// Anything else is real brightnessctl syntax; forward it as-is.
 		if err := passthroughBrightnessctl(args); err != nil {
 			fmt.Println(err)
 			return
