@@ -79,19 +79,18 @@ func clampPercent(percent int) int {
 	return percent
 }
 
-// syncHyprsunset pushes brightness to hyprsunset's gamma filter, keeping
-// color temperature fixed at identity so only brightness changes.
+// syncHyprsunset pushes brightness to hyprsunset's gamma and nothing else.
+// hyprsunset's IPC "gamma" command only changes the gamma value; the color
+// temperature and identity state (set by hyprsunset.conf profiles or by the
+// user's own keybinds) are left exactly as they are, so oledctl never
+// changes the display coloring.
 //
 // Unlike gammastep, oledctl never starts/stops hyprsunset — it's a
 // long-lived daemon (exec-once or systemd) that oledctl just updates over
 // IPC. That means no gamma-control handoff and no blink on brightness
-// change. If hyprsunset isn't running, these calls fail fast and the
+// change. If hyprsunset isn't running, this call fails fast and the
 // error surfaces to the user.
 func syncHyprsunset(percent int) error {
-	if _, err := runCommand("hyprctl", "hyprsunset", "identity"); err != nil {
-		return fmt.Errorf("disabling hyprsunset color temperature filter: %w (is hyprsunset running?)", err)
-	}
-
 	if _, err := runCommand("hyprctl", "hyprsunset", "gamma", strconv.Itoa(clampPercent(percent))); err != nil {
 		return fmt.Errorf("setting hyprsunset gamma: %w (is hyprsunset running?)", err)
 	}
@@ -257,6 +256,10 @@ OLEDCTL OPERATIONS
         handling as up.
     status
         Print the current brightness (via brightnessctl -m get).
+    sync
+        Re-push the current brightness to hyprsunset's gamma filter
+        without changing it. Useful after a hyprsunset profile switch
+        (see DESCRIPTION), e.g. from a timer or at login.
 
 OPTIONS
     -h, --help
@@ -280,9 +283,18 @@ DESCRIPTION
     brightness, so it feels like adjusting the same brightness
     brightnessctl reports. This is needed on most OLED displays, which
     lack a backlight and don't expose any way to change the pixel
-    brightness directly. hyprsunset's color temperature filter is kept
-    permanently disabled (identity) — only its gamma filter is used,
-    to isolate brightness from color shift.
+    brightness directly. oledctl only sets hyprsunset's gamma and
+    never touches color temperature or identity, so coloring is left
+    entirely to hyprsunset.conf (day/night profiles) and to your own
+    "hyprctl hyprsunset temperature/identity" keybinds.
+
+    Note: when a hyprsunset profile activates (at its scheduled time),
+    hyprsunset reloads that profile's temperature, identity AND gamma
+    (gamma defaults to 100%), which resets the brightness oledctl set.
+    To keep brightness across a switch, add this to each profile in
+    hyprsunset.conf:
+        on-switch = oledctl sync
+    which re-applies the current brightness after every switch.
 
     hyprsunset must already be running (e.g. via "exec-once =
     hyprsunset" in hyprland.conf, or its systemd user service) —
@@ -350,6 +362,14 @@ func main() {
 		if err := printStatus(); err != nil {
 			fmt.Println("error:", err)
 			return
+		}
+	case "sync":
+		if err := getBrightness(); err != nil {
+			fmt.Println("error:", err)
+			return
+		}
+		if err := syncHyprsunset(currentBrightness); err != nil {
+			fmt.Println("error syncing hyprsunset:", err)
 		}
 	case "up":
 		step, flags, err := parseUpDownArgs(args, defaultStep)

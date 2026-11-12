@@ -2,11 +2,9 @@
 
 This program works as a middleman between brightnessctl and hyprsunset. It keeps hyprsunset's gamma filter in sync with brightnessctl's brightness, so it feels like adjusting the same brightness brightnessctl reports. This is needed on most OLED displays, which lack a backlight and don't expose any way to change the pixel brightness directly.
 
-hyprsunset's color temperature filter is kept permanently disabled (`identity`) — only its gamma filter is used, so brightness changes never shift color temperature.
+oledctl only drives hyprsunset's gamma filter. Color temperature and identity are left alone, so your own hyprsunset profiles (for example a warm night-light profile after 20:00) and any manual night-light toggle keep working, and brightness changes never shift color temperature.
 
 Unlike the gammastep-based version of oledctl, this version never starts or stops a background process itself. hyprsunset is expected to already be running as your own persistent daemon, and oledctl just sends it live updates over `hyprctl`'s IPC. That also means there's nothing to hand off between processes on each brightness change, so there's no gap where the display could flash to a default gamma table.
-
-> **Note:** this hyprsunset-based version lives on the `hyprsunset` branch of the `oledctl` repo, not on `main` (which uses gammastep). All commands below target that branch.
 
 ## Requirements
 
@@ -24,15 +22,36 @@ Unlike the gammastep-based version of oledctl, this version never starts or stop
 ## Installation
 
 ### Nix Flakes (NixOS or systems with Nix installed)
-You can run it directly from GitHub without cloning — note the trailing `/hyprsunset`, which selects the branch:
+You can run it directly from GitHub without cloning:
 ```bash
-nix run github:manicraftgap/oledctl/hyprsunset
+nix run github:manicraftgap/oledctl-hyprsunset
 ```
 
-To add it to your NixOS configuration or Home Manager, add it to your flake inputs:
+To install it declaratively on NixOS, add the repo as an input of your system flake and enable the module. There is no need to clone it onto your machine; Nix fetches and builds it from GitHub:
 ```nix
-inputs.oledctl.url = "github:manicraftgap/oledctl/hyprsunset";
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    oledctl = {
+      url = "github:manicraftgap/oledctl-hyprsunset";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { nixpkgs, oledctl, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        oledctl.nixosModules.default
+        { services.oledctl.enable = true; }
+      ];
+    };
+  };
+}
 ```
+
+Enabling the module installs `oledctl` and `hyprsunset`, and applies an overlay so that anything calling `brightnessctl` goes through oledctl. To get just the binary without the overlay, add `oledctl.packages.${pkgs.stdenv.hostPlatform.system}.default` to `environment.systemPackages` instead.
+
+Update to the latest commit with `nix flake update oledctl`. Don't point the input at a local checkout (`path:` or `git+file:`); use the GitHub URL, or `git+ssh://git@github.com/manicraftgap/oledctl-hyprsunset` if the repo is private.
 
 ### Arch Linux
 
@@ -41,10 +60,10 @@ First, install the required dependencies and the Go compiler:
 sudo pacman -S brightnessctl hyprsunset go
 ```
 
-Then, clone the `hyprsunset` branch and build the program:
+Then, clone and build the program:
 ```bash
-git clone -b hyprsunset https://github.com/manicraftgap/oledctl.git
-cd oledctl
+git clone https://github.com/manicraftgap/oledctl-hyprsunset.git
+cd oledctl-hyprsunset
 go build -o oledctl ./cmd/oledctl
 sudo mv oledctl /usr/local/bin/
 ```
@@ -57,10 +76,10 @@ sudo apt update
 sudo apt install brightnessctl golang
 ```
 
-Then, clone the `hyprsunset` branch and build the program:
+Then, clone and build the program:
 ```bash
-git clone -b hyprsunset https://github.com/manicraftgap/oledctl.git
-cd oledctl
+git clone https://github.com/manicraftgap/oledctl-hyprsunset.git
+cd oledctl-hyprsunset
 go build -o oledctl ./cmd/oledctl
 sudo mv oledctl /usr/local/bin/
 ```
@@ -72,10 +91,10 @@ First, install the required dependencies and the Go compiler:
 sudo xbps-install -S brightnessctl hyprsunset go
 ```
 
-Then, clone the `hyprsunset` branch and build the program:
+Then, clone and build the program:
 ```bash
-git clone -b hyprsunset https://github.com/manicraftgap/oledctl.git
-cd oledctl
+git clone https://github.com/manicraftgap/oledctl-hyprsunset.git
+cd oledctl-hyprsunset
 go build -o oledctl ./cmd/oledctl
 sudo mv oledctl /usr/local/bin/
 ```
@@ -88,11 +107,33 @@ Modifying brightness requires the underlying `brightnessctl` command to have wri
 2. Installing `brightnessctl` as a suid binary.
 3. Using the `systemd-logind` API.
 
+## Using with hyprsunset profiles
+
+oledctl never changes temperature or identity, so a `hyprsunset.conf` with a daytime and a night-light profile works unchanged:
+
+```
+profile {
+    time = 07:00
+    identity = true
+}
+profile {
+    time = 20:00
+    temperature = 4000
+}
+```
+
+hyprsunset resets every option, gamma included, when it starts and whenever a profile activates (07:00 and 20:00 above). Until the next brightness change, gamma is back at the profile's value (100% unless the profile sets `gamma`). Run `oledctl sync` to re-apply gamma from the current brightness. To do it at login, start it after hyprsunset:
+
+```
+exec-once = hyprsunset
+exec-once = sleep 1 && oledctl sync
+```
+
 ## Usage
 
 ```text
 NAME
-    oledctl - sync display brightness and OLED-safe color temperature
+    oledctl - keep hyprsunset's gamma filter in sync with display brightness
 
 SYNOPSIS
     oledctl [operation] [value...]
@@ -114,6 +155,10 @@ OLEDCTL OPERATIONS
         passed through to brightnessctl, but oledctl detects the set
         operation and automatically resyncs hyprsunset to match the new
         brightness afterward.
+    sync
+        Re-apply hyprsunset's gamma filter from the current brightness
+        without changing it. Run it after hyprsunset starts or switches
+        profile, since either resets gamma.
     status
         Print the current brightness (via brightnessctl -m get).
 

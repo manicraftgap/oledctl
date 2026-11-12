@@ -37,14 +37,14 @@
       overlays.default = final: prev: {
         brightnessctl = final.writeShellScriptBin "brightnessctl" ''
           export REAL_BRIGHTNESSCTL="${prev.brightnessctl}/bin/brightnessctl"
-          exec ${self.packages.${final.system}.default}/bin/oledctl "$@"
+          exec ${self.packages.${final.stdenv.hostPlatform.system}.default}/bin/oledctl "$@"
         '';
       };
 
       nixosModules.default = { config, lib, pkgs, ... }:
         let
           cfg = config.services.oledctl;
-          oledctlPkg = self.packages.${pkgs.system}.default;
+          oledctlPkg = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         in
         {
           options.services.oledctl = {
